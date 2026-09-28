@@ -1,0 +1,20 @@
+# Secrets and credentials
+.env
+*.env
+credentials.json
+token.json
+*.pem
+*.key
+
+# Python bytecode and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# IDE & OS files
+.DS_Store
+.idea/
+.vscode/

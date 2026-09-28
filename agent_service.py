@@ -417,8 +417,28 @@ def search_documents(query: str, location: Optional[str] = None):
         return get_orchestrator().process_query(query, location=location)
     except Exception as e:
         logger.exception("An error occurred during document search.")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
-
+@app.get("/.well-known/agent-card.json")
+@app.get("/a2a/app/.well-known/agent-card.json")
+def get_agent_card():
+    """
+    Returns A2A Agent Card metadata for agent discovery and registry.
+    """
+    return {
+        "name": "Enterprise Document Research Agent (ERA)",
+        "description": "Intelligent RAG agent with primary document retrieval and web search fallback.",
+        "version": "1.0.0",
+        "protocol_version": "0.3.0",
+        "capabilities": {
+            "search": True,
+            "document_retrieval": True,
+            "web_fallback": True
+        },
+        "endpoints": {
+            "query": "/query",
+            "search": "/search",
+            "health": "/health"
+        }
+    }
 
 
 @app.get("/", response_class=HTMLResponse)

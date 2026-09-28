@@ -20,10 +20,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy core service code and configuration
+# Copy core service code, documents, and configuration
 COPY config.py .
 COPY agent_service.py .
-COPY .env .env
+COPY documents ./documents
 
 # Expose FastAPI application port
 EXPOSE 8000

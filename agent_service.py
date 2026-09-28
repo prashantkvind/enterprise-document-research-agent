@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Optional
 
 import psycopg2
 from fastapi import FastAPI, HTTPException, status
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from pinecone import Pinecone
 
@@ -39,43 +40,56 @@ class QueryResponse(BaseModel):
 class RAGRetriever:
     """
     Handles Vector DB (Pinecone) k-NN similarity search and Metadata DB (PostgreSQL) citation retrieval.
+    Includes graceful exception handling when keys/DB are unconfigured or unavailable.
     """
     def __init__(self):
-        self.pc = Pinecone(api_key=settings.pinecone_api_key)
-        self.index = self.pc.Index(settings.pinecone_index_name)
-        self.embeddings = OpenAIEmbeddings(
-            model="text-embedding-ada-002",
-            openai_api_key=settings.openai_api_key
-        )
+        self.pc_key = settings.pinecone_api_key
+        self.openai_key = settings.openai_api_key
 
     def search_chunks(self, query: str, top_k: int = 5) -> Dict[str, Any]:
         """
         Embed query, execute Pinecone k-NN search, and filter results by SIMILARITY_THRESHOLD.
+        Returns empty chunks list on missing/invalid keys to trigger seamless web fallback.
         """
-        logger.info(f"Executing Pinecone vector search for query: '{query}'")
-        query_vector = self.embeddings.embed_query(query)
-
-        search_response = self.index.query(
-            vector=query_vector,
-            top_k=top_k,
-            include_metadata=True
-        )
-
-        matches = search_response.get("matches", [])
-        logger.info(f"Retrieved {len(matches)} raw vector matches from Pinecone.")
-
-        # Filter by threshold (0.75)
-        filtered_matches = [
-            m for m in matches if m.get("score", 0.0) >= settings.similarity_threshold
-        ]
-        logger.info(f"{len(filtered_matches)} matches passed SIMILARITY_THRESHOLD ({settings.similarity_threshold}).")
-
-        if not filtered_matches:
+        if not self.pc_key or "your_" in self.pc_key.lower():
+            logger.warning("Pinecone API key is unconfigured or default placeholder. Falling back to external web search.")
             return {"chunks": [], "sources": []}
 
-        # Retrieve detailed text and document metadata from PostgreSQL
-        vector_ids = [m["id"] for m in filtered_matches]
-        return self._get_metadata_for_vectors(vector_ids)
+        try:
+            pc = Pinecone(api_key=self.pc_key)
+            index = pc.Index(settings.pinecone_index_name)
+            embeddings = OpenAIEmbeddings(
+                model="text-embedding-ada-002",
+                openai_api_key=self.openai_key if (self.openai_key and "your_" not in self.openai_key.lower()) else None
+            )
+
+            logger.info(f"Executing Pinecone vector search for query: '{query}'")
+            query_vector = embeddings.embed_query(query)
+
+            search_response = index.query(
+                vector=query_vector,
+                top_k=top_k,
+                include_metadata=True
+            )
+
+            matches = search_response.get("matches", [])
+            logger.info(f"Retrieved {len(matches)} raw vector matches from Pinecone.")
+
+            # Filter by threshold (0.75)
+            filtered_matches = [
+                m for m in matches if m.get("score", 0.0) >= settings.similarity_threshold
+            ]
+            logger.info(f"{len(filtered_matches)} matches passed SIMILARITY_THRESHOLD ({settings.similarity_threshold}).")
+
+            if not filtered_matches:
+                return {"chunks": [], "sources": []}
+
+            # Retrieve detailed text and document metadata from PostgreSQL
+            vector_ids = [m["id"] for m in filtered_matches]
+            return self._get_metadata_for_vectors(vector_ids)
+        except Exception as e:
+            logger.warning(f"Vector retrieval unavailable or unconfigured ({e}). Falling back to external search.")
+            return {"chunks": [], "sources": []}
 
     def _get_metadata_for_vectors(self, vector_ids: List[str]) -> Dict[str, Any]:
         """
@@ -126,11 +140,12 @@ class AgentOrchestrator:
     """
     def __init__(self):
         self.retriever = RAGRetriever()
+        openai_key = settings.openai_api_key if (settings.openai_api_key and "your_" not in settings.openai_api_key.lower()) else None
         self.llm = ChatOpenAI(
             model="gpt-4-turbo",
             temperature=0.0,
-            openai_api_key=settings.openai_api_key
-        )
+            openai_api_key=openai_key
+        ) if openai_key else None
         self.ddg_search = DuckDuckGoSearchRun()
 
     def process_query(self, query: str) -> QueryResponse:
@@ -141,7 +156,7 @@ class AgentOrchestrator:
         chunks = rag_data["chunks"]
         internal_sources = rag_data["sources"]
 
-        if chunks:
+        if chunks and self.llm:
             # Step 2: Attempt answer generation using internal document context
             context_block = "\n\n---\n\n".join(chunks)
             system_prompt = (
@@ -159,21 +174,22 @@ class AgentOrchestrator:
                 HumanMessage(content=f"Context:\n{context_block}\n\nUser Question: {query}")
             ]
 
-            llm_response = self.llm.invoke(messages)
-            llm_text = llm_response.content.strip()
+            try:
+                llm_response = self.llm.invoke(messages)
+                llm_text = llm_response.content.strip()
 
-            # Step 3: Check for failure signal
-            if "[CONTEXT_INSUFFICIENT]" not in llm_text and llm_text != "":
-                logger.info("RAG context was sufficient. Returning internal document answer.")
-                return QueryResponse(
-                    answer=llm_text,
-                    source_type="Internal Documents",
-                    sources=internal_sources
-                )
-            else:
-                logger.info("LLM reported [CONTEXT_INSUFFICIENT]. Triggering external fallback path.")
-        else:
-            logger.info("No internal chunks met the SIMILARITY_THRESHOLD. Triggering external fallback path.")
+                # Step 3: Check for failure signal
+                if "[CONTEXT_INSUFFICIENT]" not in llm_text and llm_text != "":
+                    logger.info("RAG context was sufficient. Returning internal document answer.")
+                    return QueryResponse(
+                        answer=llm_text,
+                        source_type="Internal Documents",
+                        sources=internal_sources
+                    )
+                else:
+                    logger.info("LLM reported [CONTEXT_INSUFFICIENT]. Triggering external fallback path.")
+            except Exception as e:
+                logger.warning(f"LLM invocation failed ({e}). Proceeding to external fallback search.")
 
         # Step 4: Fallback Mechanism (DuckDuckGo Search)
         return self._execute_fallback(query)
@@ -189,28 +205,42 @@ class AgentOrchestrator:
             logger.error(f"DuckDuckGo search execution failed: {e}")
             search_results = "No external search results could be retrieved at this time."
 
-        fallback_system_prompt = (
-            "You are the Enterprise Document Research Agent (ERA).\n"
-            "Internal company documents did not contain sufficient context to answer the user's question.\n"
-            "Synthesize a clear, helpful, and accurate response using the provided web search results."
-        )
+        if self.llm:
+            fallback_system_prompt = (
+                "You are the Enterprise Document Research Agent (ERA).\n"
+                "Internal company documents did not contain sufficient context to answer the user's question.\n"
+                "Synthesize a clear, helpful, and accurate response using the provided web search results."
+            )
 
-        messages = [
-            SystemMessage(content=fallback_system_prompt),
-            HumanMessage(content=f"External Web Search Results:\n{search_results}\n\nUser Question: {query}")
-        ]
+            messages = [
+                SystemMessage(content=fallback_system_prompt),
+                HumanMessage(content=f"External Web Search Results:\n{search_results}\n\nUser Question: {query}")
+            ]
 
-        synthesized_response = self.llm.invoke(messages)
+            try:
+                synthesized_response = self.llm.invoke(messages)
+                answer_text = synthesized_response.content.strip()
+            except Exception as e:
+                logger.warning(f"LLM synthesis failed during fallback ({e}). Returning raw search summary.")
+                answer_text = f"External search results summary:\n{search_results}"
+        else:
+            answer_text = f"External search results summary:\n{search_results}"
 
         return QueryResponse(
-            answer=synthesized_response.content.strip(),
+            answer=answer_text,
             source_type="External Search",
             sources=["External Web Search (DuckDuckGo)"]
         )
 
 
-# Instantiate Agent Orchestrator
-orchestrator = AgentOrchestrator()
+# Instantiate Agent Orchestrator lazily when needed
+_orchestrator: Optional[AgentOrchestrator] = None
+
+def get_orchestrator() -> AgentOrchestrator:
+    global _orchestrator
+    if _orchestrator is None:
+        _orchestrator = AgentOrchestrator()
+    return _orchestrator
 
 
 @app.get("/health", status_code=status.HTTP_200_OK)
@@ -233,7 +263,7 @@ def query_agent(request: QueryRequest):
         )
 
     try:
-        response = orchestrator.process_query(request.query)
+        response = get_orchestrator().process_query(request.query)
         return response
     except Exception as e:
         logger.exception("An error occurred while processing the agent query.")
@@ -241,6 +271,141 @@ def query_agent(request: QueryRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred in agent orchestration: {str(e)}"
         )
+
+
+@app.get("/", response_class=HTMLResponse)
+@app.get("/playground", response_class=HTMLResponse)
+def serve_playground():
+    """
+    Serves a modern, interactive web playground for chatting with the agent.
+    """
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Enterprise Document Research Agent (ERA) Playground</title>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+        <style>
+            * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }
+            body { background: #0f172a; color: #f8fafc; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+            header { background: #1e293b; padding: 1.2rem 2rem; border-bottom: 1px solid #334155; display: flex; align-items: center; justify-content: space-between; }
+            header h1 { font-size: 1.25rem; font-weight: 600; color: #38bdf8; display: flex; align-items: center; gap: 0.5rem; }
+            header .status-badge { font-size: 0.8rem; padding: 0.25rem 0.75rem; background: #064e3b; color: #34d399; border-radius: 9999px; border: 1px solid #059669; }
+            main { flex: 1; overflow-y: auto; padding: 2rem; display: flex; flex-direction: column; gap: 1.5rem; max-width: 900px; width: 100%; margin: 0 auto; }
+            .chat-bubble { display: flex; flex-direction: column; gap: 0.5rem; max-width: 80%; }
+            .chat-bubble.user { align-self: flex-end; }
+            .chat-bubble.agent { align-self: flex-start; }
+            .message { padding: 1rem 1.25rem; border-radius: 12px; font-size: 0.95rem; line-height: 1.5; white-space: pre-wrap; }
+            .user .message { background: #0284c7; color: #ffffff; border-bottom-right-radius: 2px; }
+            .agent .message { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-bottom-left-radius: 2px; }
+            .meta-card { margin-top: 0.5rem; padding: 0.75rem 1rem; background: #0f172a; border-radius: 8px; border: 1px solid #334155; font-size: 0.85rem; }
+            .source-tag { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; margin-bottom: 0.4rem; }
+            .tag-internal { background: #1e1b4b; color: #a5b4fc; border: 1px solid #4338ca; }
+            .tag-external { background: #451a03; color: #fde047; border: 1px solid #b45309; }
+            .sources-list { color: #94a3b8; font-size: 0.8rem; }
+            .sources-list li { margin-left: 1.2rem; }
+            footer { padding: 1.2rem 2rem; background: #1e293b; border-top: 1px solid #334155; }
+            .input-box { max-width: 900px; margin: 0 auto; display: flex; gap: 0.75rem; }
+            input[type="text"] { flex: 1; background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 0.85rem 1.2rem; color: #f8fafc; font-size: 0.95rem; outline: none; }
+            input[type="text"]:focus { border-color: #38bdf8; }
+            button { background: #0284c7; color: white; border: none; border-radius: 8px; padding: 0.85rem 1.5rem; font-size: 0.95rem; font-weight: 500; cursor: pointer; transition: background 0.2s; }
+            button:hover { background: #0369a1; }
+            button:disabled { background: #334155; cursor: not-allowed; }
+            .loading { font-style: italic; color: #94a3b8; }
+        </style>
+    </head>
+    <body>
+        <header>
+            <h1>🔍 Enterprise Document Research Agent (ERA)</h1>
+            <span class="status-badge">● API Online</span>
+        </header>
+        <main id="chat-window">
+            <div class="chat-bubble agent">
+                <div class="message">
+                    👋 Hello! I am the <b>Enterprise Document Research Agent</b>.<br><br>
+                    Ask me any question. I will search internal company documents first (RAG), and seamlessly fall back to web search if needed.
+                </div>
+            </div>
+        </main>
+        <footer>
+            <div class="input-box">
+                <input type="text" id="query-input" placeholder="Type your research question..." onkeydown="if(event.key==='Enter') sendQuery()">
+                <button id="send-btn" onclick="sendQuery()">Send Query</button>
+            </div>
+        </footer>
+
+        <script>
+            async function sendQuery() {
+                const input = document.getElementById('query-input');
+                const btn = document.getElementById('send-btn');
+                const chatWindow = document.getElementById('chat-window');
+                const query = input.value.trim();
+
+                if (!query) return;
+
+                // Add User Message
+                const userBubble = document.createElement('div');
+                userBubble.className = 'chat-bubble user';
+                userBubble.innerHTML = `<div class="message">${escapeHtml(query)}</div>`;
+                chatWindow.appendChild(userBubble);
+
+                input.value = '';
+                input.disabled = true;
+                btn.disabled = true;
+
+                // Add Loading Agent Message
+                const agentBubble = document.createElement('div');
+                agentBubble.className = 'chat-bubble agent';
+                agentBubble.innerHTML = `<div class="message loading">Searching internal documents & synthesizing response...</div>`;
+                chatWindow.appendChild(agentBubble);
+                chatWindow.scrollTop = chatWindow.scrollHeight;
+
+                try {
+                    const response = await fetch('/query', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ query: query })
+                    });
+
+                    const data = await response.json();
+
+                    if (response.ok) {
+                        const isInternal = data.source_type === "Internal Documents";
+                        const tagClass = isInternal ? "tag-internal" : "tag-external";
+                        const sourcesList = data.sources.map(s => `<li>${escapeHtml(s)}</li>`).join('');
+
+                        agentBubble.innerHTML = `
+                            <div class="message">${escapeHtml(data.answer)}</div>
+                            <div class="meta-card">
+                                <span class="source-tag ${tagClass}">${escapeHtml(data.source_type)}</span>
+                                <div class="sources-list">
+                                    <b>Sources Used:</b>
+                                    <ul>${sourcesList}</ul>
+                                </div>
+                            </div>
+                        `;
+                    } else {
+                        agentBubble.innerHTML = `<div class="message" style="color:#f87171;">Error: ${escapeHtml(data.detail || 'Failed to get response.')}</div>`;
+                    }
+                } catch (err) {
+                    agentBubble.innerHTML = `<div class="message" style="color:#f87171;">Network Error: ${escapeHtml(err.message)}</div>`;
+                } finally {
+                    input.disabled = false;
+                    btn.disabled = false;
+                    input.focus();
+                    chatWindow.scrollTop = chatWindow.scrollHeight;
+                }
+            }
+
+            function escapeHtml(text) {
+                return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+            }
+        </script>
+    </body>
+    </html>
+    """
 
 
 if __name__ == "__main__":

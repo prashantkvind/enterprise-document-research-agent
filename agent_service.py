@@ -1,15 +1,34 @@
+import os
+import re
+import glob
 import logging
 from typing import List, Dict, Any, Optional
 
-import psycopg2
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
 from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from pinecone import Pinecone
+try:
+    from pinecone import Pinecone
+except ImportError:
+    Pinecone = None
 
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.tools import DuckDuckGoSearchRun
-from langchain_core.messages import SystemMessage, HumanMessage
+try:
+    from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+except ImportError:
+    OpenAIEmbeddings = None
+    ChatOpenAI = None
+
+try:
+    from langchain_community.tools import DuckDuckGoSearchRun
+    from langchain_core.messages import SystemMessage, HumanMessage
+except ImportError:
+    DuckDuckGoSearchRun = None
+    SystemMessage = None
+    HumanMessage = None
 
 from config import settings
 
@@ -20,20 +39,30 @@ logger = logging.getLogger(__name__)
 # FastAPI Application
 app = FastAPI(
     title="Enterprise Document Research Agent (ERA)",
-    description="Intelligent RAG agent with primary document retrieval and web search fallback.",
-    version="1.0.0"
+    description="Intelligent RAG agent with primary document retrieval, local location search, and web search fallback.",
+    version="1.1.0"
 )
 
 
 # Pydantic Models for Request and Response
 class QueryRequest(BaseModel):
     query: str = Field(..., description="User question or research query", example="What is our Q3 revenue retention rate?")
+    location: Optional[str] = Field(None, description="Optional directory location to search documents in", example="./documents")
+
+
+class MatchDetail(BaseModel):
+    file_name: str = Field(..., description="Name of matching document file")
+    file_path: str = Field(..., description="Full path or relative location of document file")
+    score: float = Field(..., description="Relevance or similarity score")
+    snippet: str = Field(..., description="Excerpt or snippet from matching document chunk")
 
 
 class QueryResponse(BaseModel):
     answer: str = Field(..., description="Synthesized answer to the user query")
     source_type: str = Field(..., description="Source type used: 'Internal Documents' or 'External Search'")
     sources: List[str] = Field(..., description="List of document names or search sources used for citation")
+    matches: Optional[List[MatchDetail]] = Field(default=[], description="Detailed document match snippets and scores")
+
 
 
 # Helper Service Classes
@@ -51,8 +80,8 @@ class RAGRetriever:
         Embed query, execute Pinecone k-NN search, and filter results by SIMILARITY_THRESHOLD.
         Returns empty chunks list on missing/invalid keys to trigger seamless web fallback.
         """
-        if not self.pc_key or "your_" in self.pc_key.lower():
-            logger.warning("Pinecone API key is unconfigured or default placeholder. Falling back to external web search.")
+        if not Pinecone or not OpenAIEmbeddings or not self.pc_key or "your_" in self.pc_key.lower():
+            logger.warning("Pinecone/OpenAI packages or API key unconfigured. Routing to Local Directory Searcher.")
             return {"chunks": [], "sources": []}
 
         try:
@@ -95,6 +124,9 @@ class RAGRetriever:
         """
         Fetch chunk text and document title metadata from PostgreSQL database for citation mapping.
         """
+        if not psycopg2:
+            logger.warning("psycopg2 module not installed; skipping PostgreSQL metadata lookup.")
+            return {"chunks": [], "sources": []}
         try:
             conn = psycopg2.connect(
                 host=settings.postgres_host,
@@ -134,76 +166,177 @@ class RAGRetriever:
             return {"chunks": [], "sources": []}
 
 
+class LocalDirectoryRetriever:
+    """
+    Scans and searches documents in a specified local directory location (e.g. ./documents or custom path).
+    Provides hybrid keyword matching and text scoring across local files (.txt, .md, .csv, .json, .py, etc.).
+    """
+    def search_location(self, query: str, location: Optional[str] = None, top_k: int = 5) -> Dict[str, Any]:
+        target_dir = location if (location and os.path.exists(location)) else settings.documents_dir
+        if not target_dir or not os.path.exists(target_dir):
+            logger.warning(f"Target document location '{target_dir}' does not exist.")
+            return {"chunks": [], "sources": [], "matches": []}
+
+        query_terms = [t.lower() for t in re.findall(r'\w+', query) if len(t) > 2]
+        if not query_terms:
+            query_terms = [query.lower()]
+
+        supported_extensions = ['.txt', '.md', '.markdown', '.json', '.csv', '.py', '.html', '.rst', '.log', '.doc', '.pdf']
+        file_paths = []
+        for root, _, files in os.walk(target_dir):
+            for file in files:
+                ext = os.path.splitext(file)[1].lower()
+                if ext in supported_extensions or not ext:
+                    file_paths.append(os.path.join(root, file))
+
+        scored_chunks = []
+        for file_path in file_paths:
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+
+                if not content.strip():
+                    continue
+
+                rel_path = os.path.relpath(file_path, target_dir)
+                file_name = os.path.basename(file_path)
+
+                paragraphs = [p.strip() for p in re.split(r'\n\s*\n', content) if p.strip()]
+                for idx, para in enumerate(paragraphs):
+                    para_lower = para.lower()
+                    matches_count = sum(1 for term in query_terms if term in para_lower)
+
+                    if matches_count > 0:
+                        score = min(0.99, (matches_count / len(query_terms)) * 0.75 + 0.20)
+                        scored_chunks.append({
+                            "chunk_text": f"[Source: {file_name} ({rel_path})]\n{para}",
+                            "file_name": file_name,
+                            "file_path": file_path,
+                            "snippet": para[:300] + ("..." if len(para) > 300 else ""),
+                            "score": round(score, 3)
+                        })
+            except Exception as e:
+                logger.error(f"Error reading file {file_path}: {e}")
+
+        scored_chunks.sort(key=lambda x: x["score"], reverse=True)
+        top_matches = scored_chunks[:top_k]
+
+        chunks = [m["chunk_text"] for m in top_matches]
+        sources = list(set([m["file_name"] for m in top_matches]))
+        match_details = [
+            MatchDetail(
+                file_name=m["file_name"],
+                file_path=m["file_path"],
+                score=m["score"],
+                snippet=m["snippet"]
+            )
+            for m in top_matches
+        ]
+
+        logger.info(f"LocalDirectoryRetriever found {len(top_matches)} relevant matches in location '{target_dir}'.")
+        return {
+            "chunks": chunks,
+            "sources": sources,
+            "matches": match_details
+        }
+
+
 class AgentOrchestrator:
     """
-    Orchestrates Primary Search (RAG), Failure Detection ([CONTEXT_INSUFFICIENT]), Fallback Search, and Final Synthesis.
+    Orchestrates Vector Search (Pinecone/PG), Local Directory Search, Fallback Search, and Final Synthesis.
     """
     def __init__(self):
         self.retriever = RAGRetriever()
+        self.local_retriever = LocalDirectoryRetriever()
         openai_key = settings.openai_api_key if (settings.openai_api_key and "your_" not in settings.openai_api_key.lower()) else None
         self.llm = ChatOpenAI(
             model="gpt-4-turbo",
             temperature=0.0,
             openai_api_key=openai_key
-        ) if openai_key else None
-        self.ddg_search = DuckDuckGoSearchRun()
+        ) if (ChatOpenAI and openai_key) else None
+        try:
+            self.ddg_search = DuckDuckGoSearchRun() if DuckDuckGoSearchRun else None
+        except Exception as e:
+            logger.warning(f"DuckDuckGo search tool initialization skipped: {e}")
+            self.ddg_search = None
 
-    def process_query(self, query: str) -> QueryResponse:
-        logger.info(f"Processing query: '{query}'")
+    def process_query(self, query: str, location: Optional[str] = None) -> QueryResponse:
+        logger.info(f"Processing query: '{query}' (Target Location: '{location or settings.documents_dir}')")
 
         # Step 1: Primary Search (RAG against Pinecone & PostgreSQL)
         rag_data = self.retriever.search_chunks(query)
-        chunks = rag_data["chunks"]
-        internal_sources = rag_data["sources"]
+        chunks = rag_data.get("chunks", [])
+        internal_sources = rag_data.get("sources", [])
+        matches = rag_data.get("matches", [])
 
-        if chunks and self.llm:
-            # Step 2: Attempt answer generation using internal document context
+        # Step 2: Fallback to Local Directory Search if Pinecone returned 0 results or failed
+        if not chunks:
+            logger.info("Pinecone/Vector DB returned 0 chunks or is unconfigured. Querying Local Directory Retriever.")
+            local_data = self.local_retriever.search_location(query, location=location)
+            chunks = local_data.get("chunks", [])
+            internal_sources = local_data.get("sources", [])
+            matches = local_data.get("matches", [])
+
+        if chunks:
             context_block = "\n\n---\n\n".join(chunks)
-            system_prompt = (
-                "You are the Enterprise Document Research Agent (ERA).\n"
-                "Your job is to answer the user's query using ONLY the provided internal document context.\n\n"
-                "STRICT INSTRUCTIONS:\n"
-                "1. If the answer CANNOT be fully and accurately generated using ONLY the provided context, "
-                "you MUST respond with the exact string: [CONTEXT_INSUFFICIENT]\n"
-                "2. Do NOT use outside knowledge or assumptions if the context is missing key details.\n"
-                "3. If sufficient, provide a concise, factual, and complete answer with source citations."
+            if self.llm:
+                system_prompt = (
+                    "You are the Enterprise Document Research Agent (ERA).\n"
+                    "Your job is to answer the user's query using ONLY the provided internal document context.\n\n"
+                    "STRICT INSTRUCTIONS:\n"
+                    "1. If the answer CANNOT be fully and accurately generated using ONLY the provided context, "
+                    "you MUST respond with the exact string: [CONTEXT_INSUFFICIENT]\n"
+                    "2. Do NOT use outside knowledge or assumptions if the context is missing key details.\n"
+                    "3. If sufficient, provide a concise, factual, and complete answer with source citations."
+                )
+
+                messages = [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=f"Context:\n{context_block}\n\nUser Question: {query}")
+                ]
+
+                try:
+                    llm_response = self.llm.invoke(messages)
+                    llm_text = llm_response.content.strip()
+
+                    if "[CONTEXT_INSUFFICIENT]" not in llm_text and llm_text != "":
+                        logger.info("Document context was sufficient. Returning internal document answer.")
+                        return QueryResponse(
+                            answer=llm_text,
+                            source_type="Internal Documents",
+                            sources=internal_sources,
+                            matches=matches
+                        )
+                    else:
+                        logger.info("LLM reported [CONTEXT_INSUFFICIENT]. Triggering external fallback path.")
+                except Exception as e:
+                    logger.warning(f"LLM invocation failed ({e}). Returning extracted document snippets.")
+
+            # Fallback if LLM key is absent: return structured document search matches
+            formatted_answer = f"Found {len(chunks)} relevant document matches in specified location:\n\n" + "\n\n".join([f"📄 **{m.file_name}** (Relevance: {int(m.score*100)}%):\n\"{m.snippet}\"" for m in matches])
+            return QueryResponse(
+                answer=formatted_answer,
+                source_type="Internal Documents",
+                sources=internal_sources,
+                matches=matches
             )
 
-            messages = [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=f"Context:\n{context_block}\n\nUser Question: {query}")
-            ]
-
-            try:
-                llm_response = self.llm.invoke(messages)
-                llm_text = llm_response.content.strip()
-
-                # Step 3: Check for failure signal
-                if "[CONTEXT_INSUFFICIENT]" not in llm_text and llm_text != "":
-                    logger.info("RAG context was sufficient. Returning internal document answer.")
-                    return QueryResponse(
-                        answer=llm_text,
-                        source_type="Internal Documents",
-                        sources=internal_sources
-                    )
-                else:
-                    logger.info("LLM reported [CONTEXT_INSUFFICIENT]. Triggering external fallback path.")
-            except Exception as e:
-                logger.warning(f"LLM invocation failed ({e}). Proceeding to external fallback search.")
-
-        # Step 4: Fallback Mechanism (DuckDuckGo Search)
+        # Step 3: Fallback Mechanism (DuckDuckGo Search)
         return self._execute_fallback(query)
+
 
     def _execute_fallback(self, query: str) -> QueryResponse:
         """
         Execute DuckDuckGo search fallback when RAG context is missing or insufficient.
         """
-        logger.info(f"Executing DuckDuckGo web search fallback for query: '{query}'")
-        try:
-            search_results = self.ddg_search.run(query)
-        except Exception as e:
-            logger.error(f"DuckDuckGo search execution failed: {e}")
-            search_results = "No external search results could be retrieved at this time."
+        if self.ddg_search:
+            try:
+                search_results = self.ddg_search.run(query)
+            except Exception as e:
+                logger.error(f"DuckDuckGo search execution failed: {e}")
+                search_results = "No external search results could be retrieved at this time."
+        else:
+            search_results = "External web search tool is unconfigured or not installed."
 
         if self.llm:
             fallback_system_prompt = (
@@ -263,7 +396,7 @@ def query_agent(request: QueryRequest):
         )
 
     try:
-        response = get_orchestrator().process_query(request.query)
+        response = get_orchestrator().process_query(request.query, location=request.location)
         return response
     except Exception as e:
         logger.exception("An error occurred while processing the agent query.")
@@ -271,6 +404,21 @@ def query_agent(request: QueryRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An error occurred in agent orchestration: {str(e)}"
         )
+
+
+@app.get("/search", response_model=QueryResponse, status_code=status.HTTP_200_OK)
+def search_documents(query: str, location: Optional[str] = None):
+    """
+    Direct endpoint to search documents in a specified location directory.
+    """
+    if not query.strip():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Query string cannot be empty.")
+    try:
+        return get_orchestrator().process_query(query, location=location)
+    except Exception as e:
+        logger.exception("An error occurred during document search.")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
 
 
 @app.get("/", response_class=HTMLResponse)

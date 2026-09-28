@@ -26,10 +26,16 @@ class Settings(BaseSettings):
     gdrive_credentials_file: str = Field(default="credentials.json", validation_alias="GDRIVE_CREDENTIALS_FILE")
     gdrive_token_file: str = Field(default="token.json", validation_alias="GDRIVE_TOKEN_FILE")
 
+    # Local Documents Directory Settings
+    documents_dir: str = Field(default="./documents", validation_alias="DOCUMENTS_DIR")
+
     # Processing & Retrieval Settings
     chunk_size: int = Field(default=1000, validation_alias="CHUNK_SIZE")
     chunk_overlap: int = Field(default=200, validation_alias="CHUNK_OVERLAP")
     similarity_threshold: float = Field(default=0.75, validation_alias="SIMILARITY_THRESHOLD")
+
+    # Demo & Fallback Settings
+    demo_mode: bool = Field(default=True, validation_alias="DEMO_MODE")
 
     # Server API Settings
     port: int = Field(default=8000, validation_alias="PORT")

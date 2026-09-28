@@ -72,6 +72,29 @@ def list_files_in_folder(service, folder_id: str) -> List[Dict[str, Any]]:
     return files
 
 
+def list_local_files(directory_path: str) -> List[Dict[str, Any]]:
+    """
+    List files in specified local directory location for ingestion.
+    """
+    files = []
+    if not os.path.exists(directory_path):
+        logger.warning(f"Local directory path '{directory_path}' does not exist.")
+        return files
+
+    for root, _, filenames in os.walk(directory_path):
+        for name in filenames:
+            full_path = os.path.join(root, name)
+            files.append({
+                "id": f"local_{abs(hash(full_path))}",
+                "name": name,
+                "path": full_path,
+                "mimeType": "text/plain"
+            })
+    logger.info(f"Retrieved {len(files)} local files from: {directory_path}")
+    return files
+
+
+
 def download_file_content(service, file_id: str, mime_type: str) -> str:
     """
     Download or export file content from Google Drive as plain text.

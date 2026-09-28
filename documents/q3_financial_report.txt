@@ -1,0 +1,12 @@
+Q3 Financial Summary Report
+=================================
+Total Revenue: $14.2M
+Gross Margin: 74%
+Net Revenue Retention: 118%
+Operating Expenses: $8.5M
+EBITDA: $2.1M
+
+Key Highlights:
+- Closed 24 new enterprise client contracts.
+- Launched Enterprise Document Research Agent (ERA) platform for automated internal document search across custom directory locations.
+- Expanded operations to EMEA region.
